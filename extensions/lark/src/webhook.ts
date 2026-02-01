@@ -141,7 +141,24 @@ async function extractTextWithMedia(
             fs.mkdirSync(downloadDir, { recursive: true });
           }
 
-          const ext = messageType === "image" ? ".png" : ".file";
+          // Detect file extension
+          let ext = messageType === "image" ? ".png" : ".file";
+
+          // Try to detect actual file type from buffer
+          if (messageType === "file") {
+            const header = buffer.slice(0, 8).toString('hex');
+            // PDF: %PDF (25 50 44 46)
+            if (header.startsWith('25504446')) {
+              ext = ".pdf";
+            }
+            // ZIP: PK (50 4B 03 04 or 50 4B 05 06)
+            else if (header.startsWith('504b0304') || header.startsWith('504b0506')) {
+              ext = ".zip";
+            }
+            // Office docs (docx/xlsx/pptx are also ZIP)
+            // Detect by header or extension if available
+          }
+
           const timestamp = Date.now();
           const filename = `lark_${timestamp}_${fileKey.substring(0, 8)}${ext}`;
           const filepath = `${downloadDir}/${filename}`;
