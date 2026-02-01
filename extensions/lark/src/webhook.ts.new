@@ -58,14 +58,8 @@ async function parseBody(req: http.IncomingMessage): Promise<unknown> {
 
 /**
  * Extract plain text from Lark message content.
- * For images/files, download and return the file path.
  */
-async function extractTextWithMedia(
-  content: string,
-  messageType: string,
-  messageId: string,
-  account: ResolvedLarkAccount
-): Promise<string> {
+function extractText(content: string, messageType: string): string {
   try {
     const parsed = JSON.parse(content);
     if (messageType === "text") {
@@ -80,85 +74,6 @@ async function extractTextWithMedia(
           .join("");
       }
       return parsed.title ?? "";
-    }
-    // For images and files, download using messageResource API
-    if (messageType === "image" || messageType === "file") {
-      const fileKey = messageType === "image" ? parsed.image_key : parsed.file_key;
-      if (!fileKey) {
-        return `[${messageType} message]`;
-      }
-
-      console.log(`[lark-webhook] Downloading ${messageType}: ${fileKey} from message ${messageId}`);
-
-      try {
-        const { createLarkClient } = await import("./client.js");
-        const client = createLarkClient(account);
-
-        console.log(`[lark-webhook] Client created, calling messageResource.get...`);
-
-        // Use messageResource API (not drive.media API!)
-        const response = await client.im.messageResource.get({
-          path: {
-            message_id: messageId,
-            file_key: fileKey,
-          },
-          params: {
-            type: messageType,
-          },
-        });
-
-        console.log(`[lark-webhook] Response received, type:`, typeof response);
-
-        // Handle response
-        let buffer: Buffer | null = null;
-        const responseAny = response as any;
-
-        if (Buffer.isBuffer(response)) {
-          buffer = response;
-        } else if (response instanceof ArrayBuffer) {
-          buffer = Buffer.from(response);
-        } else if (responseAny.data && Buffer.isBuffer(responseAny.data)) {
-          buffer = responseAny.data;
-        } else if (typeof responseAny.getReadableStream === "function") {
-          const stream = responseAny.getReadableStream();
-          const chunks: Buffer[] = [];
-          for await (const chunk of stream) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          }
-          buffer = Buffer.concat(chunks);
-        } else if (typeof responseAny[Symbol.asyncIterator] === "function") {
-          const chunks: Buffer[] = [];
-          for await (const chunk of responseAny) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          }
-          buffer = Buffer.concat(chunks);
-        }
-
-        if (buffer && buffer.length > 0) {
-          // Save to temp directory
-          const downloadDir = "/tmp/lark_downloads";
-          if (!fs.existsSync(downloadDir)) {
-            fs.mkdirSync(downloadDir, { recursive: true });
-          }
-
-          const ext = messageType === "image" ? ".png" : ".file";
-          const timestamp = Date.now();
-          const filename = `lark_${timestamp}_${fileKey.substring(0, 8)}${ext}`;
-          const filepath = `${downloadDir}/${filename}`;
-
-          fs.writeFileSync(filepath, buffer);
-
-          return `[已接收${messageType === "image" ? "图片" : "文件"}: ${filepath}]`;
-        }
-
-        // Fallback if download failed
-        return `[📷 ${messageType}: ${fileKey}]`;
-
-      } catch (error) {
-        // If download fails, return the key reference
-        console.error(`[lark-webhook] Failed to download ${messageType}:`, error);
-        return `[📷 ${messageType}: ${fileKey}]`;
-      }
     }
     return `[${messageType} message]`;
   } catch {
@@ -177,14 +92,132 @@ async function routeMessage(
   const core = api.runtime;
   const cfg = api.config;
   const { message, sender } = event;
+  // === NEW: Handle images and files ===
+  if (message.message_type === "image" || message.message_type === "file") {
+    try {
+      // Extract file key
+      let fileKey = null;
+      try {
+        const parsed = JSON.parse(message.content);
+        fileKey = message.message_type === "image" ? parsed.image_key : parsed.file_key;
+      } catch (e) {
+        api.logger.error("[lark-webhook] Failed to parse message content");
+        return;
+      }
 
-  // Extract text and download media if present
-  const text = await extractTextWithMedia(
-    message.content,
-    message.message_type,
-    message.message_id,
-    account
-  );
+      if (!fileKey) {
+        api.logger.warn("[lark-webhook] No file key found");
+        return;
+      }
+
+      api.logger.info(`[lark-webhook] Received file: ${fileKey}`);
+
+      // Get tenant access token
+      const axios = (await import("axios")).default;
+      const tokenResp = await axios.post(
+        account.domain === "feishu" 
+          ? "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+          : "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
+        {
+          app_id: account.appId,
+          app_secret: account.appSecret,
+        }
+      );
+
+      if (tokenResp.data.code !== 0) {
+        api.logger.error("[lark-webhook] Failed to get access token");
+        return;
+      }
+
+      const token = tokenResp.data.tenant_access_token;
+      
+      // Download file
+      const downloadUrl = `${account.domain === "feishu" ? "https://open.feishu.cn" : "https://open.larksuite.com"}/open-apis/drive/v1/medias/${fileKey}/download/?access_token=${token}`;
+      
+      const fileResp = await axios.get(downloadUrl, {
+        responseType: "arraybuffer"
+      });
+
+      // Determine file extension
+      let ext = message.message_type === "image" ? ".png" : ".file";
+      const timestamp = Date.now();
+      const filename = `lark_${timestamp}_${fileKey.substring(0, 8)}${ext}`;
+      
+      // Ensure download directory exists
+      const downloadDir = "/tmp/lark_downloads";
+      if (!fs.existsSync(downloadDir)) {
+        fs.mkdirSync(downloadDir, { recursive: true });
+      }
+      
+      const filepath = `${downloadDir}/${filename}`;
+      fs.writeFileSync(filepath, Buffer.from(fileResp.data));
+
+      api.logger.info(`[lark-webhook] File saved: ${filepath}`);
+
+      // Build file message
+      const fileMsg = `[已接收${message.message_type === "image" ? "图片" : "文件"}: ${filepath}]`;
+
+      // Continue with original message processing flow
+      const senderId = sender.sender_id.open_id;
+      const chatId = message.chat_id;
+      const isGroup = message.chat_type === "group";
+
+      const larkFrom = `lark:${account.accountId}:${senderId}`;
+      const larkTo = `lark:${account.accountId}:${chatId}`;
+
+      const route = await core.channel.routing.resolveAgentRoute({
+        cfg,
+        channel: "lark",
+        accountId: account.accountId,
+        chatType: isGroup ? "group" : "direct",
+        chatId,
+        senderId,
+      });
+
+      if (!route) {
+        api.logger.warn("[lark-webhook] No route found for file message");
+        return;
+      }
+
+      // Create context with file path
+      const ctxPayload = core.channel.reply.finalizeInboundContext({
+        Body: fileMsg,
+        RawBody: fileMsg,
+        CommandBody: fileMsg,
+        From: larkFrom,
+        To: larkTo,
+        SessionKey: route.sessionKey,
+        AccountId: route.accountId,
+        ChatType: isGroup ? "group" : "direct",
+        GroupSubject: isGroup ? chatId : undefined,
+        SenderName: senderId,
+        SenderId: senderId,
+        Provider: "lark",
+        Surface: "lark",
+        MessageSid: message.message_id,
+        Timestamp: Date.now(),
+        WasMentioned: false,
+        CommandAuthorized: true,
+        OriginatingChannel: "lark",
+        OriginatingTo: larkTo,
+        // Add file-related fields
+        FilePath: filepath,
+        FileType: message.message_type,
+        FileKey: fileKey,
+      });
+
+      // Invoke agent
+      await core.channel.inbound(ctxPayload);
+      return;
+
+    } catch (error) {
+      api.logger.error(`[lark-webhook] Error handling file: ${error}`);
+      return;
+    }
+  }
+
+
+  const text = extractText(message.content, message.message_type);
 
   if (!text.trim()) {
     return;

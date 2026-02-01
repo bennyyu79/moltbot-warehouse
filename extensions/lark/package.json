@@ -9,7 +9,8 @@
     ]
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.37.0"
+    "@larksuiteoapi/node-sdk": "^1.37.0",
+    "axios": "^1.13.4"
   },
   "devDependencies": {
     "typescript": "^5.0.0"

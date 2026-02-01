@@ -58,14 +58,8 @@ async function parseBody(req: http.IncomingMessage): Promise<unknown> {
 
 /**
  * Extract plain text from Lark message content.
- * For images/files, download and return the file path.
  */
-async function extractTextWithMedia(
-  content: string,
-  messageType: string,
-  messageId: string,
-  account: ResolvedLarkAccount
-): Promise<string> {
+function extractText(content: string, messageType: string): string {
   try {
     const parsed = JSON.parse(content);
     if (messageType === "text") {
@@ -80,85 +74,6 @@ async function extractTextWithMedia(
           .join("");
       }
       return parsed.title ?? "";
-    }
-    // For images and files, download using messageResource API
-    if (messageType === "image" || messageType === "file") {
-      const fileKey = messageType === "image" ? parsed.image_key : parsed.file_key;
-      if (!fileKey) {
-        return `[${messageType} message]`;
-      }
-
-      console.log(`[lark-webhook] Downloading ${messageType}: ${fileKey} from message ${messageId}`);
-
-      try {
-        const { createLarkClient } = await import("./client.js");
-        const client = createLarkClient(account);
-
-        console.log(`[lark-webhook] Client created, calling messageResource.get...`);
-
-        // Use messageResource API (not drive.media API!)
-        const response = await client.im.messageResource.get({
-          path: {
-            message_id: messageId,
-            file_key: fileKey,
-          },
-          params: {
-            type: messageType,
-          },
-        });
-
-        console.log(`[lark-webhook] Response received, type:`, typeof response);
-
-        // Handle response
-        let buffer: Buffer | null = null;
-        const responseAny = response as any;
-
-        if (Buffer.isBuffer(response)) {
-          buffer = response;
-        } else if (response instanceof ArrayBuffer) {
-          buffer = Buffer.from(response);
-        } else if (responseAny.data && Buffer.isBuffer(responseAny.data)) {
-          buffer = responseAny.data;
-        } else if (typeof responseAny.getReadableStream === "function") {
-          const stream = responseAny.getReadableStream();
-          const chunks: Buffer[] = [];
-          for await (const chunk of stream) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          }
-          buffer = Buffer.concat(chunks);
-        } else if (typeof responseAny[Symbol.asyncIterator] === "function") {
-          const chunks: Buffer[] = [];
-          for await (const chunk of responseAny) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          }
-          buffer = Buffer.concat(chunks);
-        }
-
-        if (buffer && buffer.length > 0) {
-          // Save to temp directory
-          const downloadDir = "/tmp/lark_downloads";
-          if (!fs.existsSync(downloadDir)) {
-            fs.mkdirSync(downloadDir, { recursive: true });
-          }
-
-          const ext = messageType === "image" ? ".png" : ".file";
-          const timestamp = Date.now();
-          const filename = `lark_${timestamp}_${fileKey.substring(0, 8)}${ext}`;
-          const filepath = `${downloadDir}/${filename}`;
-
-          fs.writeFileSync(filepath, buffer);
-
-          return `[已接收${messageType === "image" ? "图片" : "文件"}: ${filepath}]`;
-        }
-
-        // Fallback if download failed
-        return `[📷 ${messageType}: ${fileKey}]`;
-
-      } catch (error) {
-        // If download fails, return the key reference
-        console.error(`[lark-webhook] Failed to download ${messageType}:`, error);
-        return `[📷 ${messageType}: ${fileKey}]`;
-      }
     }
     return `[${messageType} message]`;
   } catch {
@@ -177,14 +92,7 @@ async function routeMessage(
   const core = api.runtime;
   const cfg = api.config;
   const { message, sender } = event;
-
-  // Extract text and download media if present
-  const text = await extractTextWithMedia(
-    message.content,
-    message.message_type,
-    message.message_id,
-    account
-  );
+  const text = extractText(message.content, message.message_type);
 
   if (!text.trim()) {
     return;
